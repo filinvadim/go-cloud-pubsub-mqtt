@@ -1,4 +1,4 @@
-module gocloud.dev/pubsub/mqttpubsub
+module github.com/filinvadim/go-cloud-pubsub-mqtt
 
 go 1.12
 
