@@ -38,7 +38,7 @@ func ExampleOpenTopic() {
 
 	defer cli.Disconnect(0)
 
-	topic, err := mqttpubsub.OpenTopic(mqttpubsub.NewPublisher(cli), "example.mysubject", nil)
+	topic, err := mqttpubsub.OpenTopic(mqttpubsub.NewPublisher(cli, 0, 0), "example.mysubject", nil)
 	if err != nil {
 		log.Fatal(err)
 	}
@@ -62,7 +62,7 @@ func ExampleOpenSubscription() {
 	defer cli.Disconnect(0)
 
 	subscription, err := mqttpubsub.OpenSubscription(
-		mqttpubsub.NewSubscriber(cli),
+		mqttpubsub.NewSubscriber(cli, 0, 0),
 		"example.mysubject",
 		nil)
 	if err != nil {

@@ -174,10 +174,11 @@ func (t *topic) SendBatch(ctx context.Context, msgs []*driver.Message) error {
 	}
 
 	for _, m := range msgs {
-		t.wg.Add(1)
 		if err := ctx.Err(); err != nil {
 			return err
 		}
+		t.wg.Add(1)
+
 		go func(msg *driver.Message) {
 			defer t.wg.Done()
 			t.mu.Lock()
@@ -195,7 +196,7 @@ func (t *topic) SendBatch(ctx context.Context, msgs []*driver.Message) error {
 				}
 			}
 
-			err = t.conn.Publish(t.name, payload)
+			err = t.conn.Publish(t.name, payload, nil)
 			if err != nil {
 				t.errs.Errors = append(t.errs.Errors, err)
 			}
@@ -270,7 +271,7 @@ func openSubscription(conn Subscriber, topicName string) (driver.Subscription, e
 		ds.mu.Lock()
 		ds.msgs = append(ds.msgs, m)
 		ds.mu.Unlock()
-	})
+	}, nil)
 
 	return ds, err
 }

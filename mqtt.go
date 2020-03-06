@@ -10,15 +10,17 @@ import (
 	"gocloud.dev/pubsub/driver"
 	"strings"
 	"sync"
+	"time"
 
 	mqtt "github.com/eclipse/paho.mqtt.golang"
 )
 
 const (
-	defaultQOS byte = 0
-	pubID           = "go-cloud-publisher"
-	subID           = "go-cloud-subscriber"
-	delimiter       = "-"
+	defaultTimeout = 2 * time.Second
+	defaultQOS     = 0
+	defaultPubID   = "go-cloud-publisher"
+	defaultSubID   = "go-cloud-subscriber"
+	delimiter      = "-"
 )
 
 var (
@@ -31,37 +33,47 @@ var (
 
 type (
 	Subscriber interface {
-		Subscribe(topic string, handler mqtt.MessageHandler) error
+		Subscribe(topic string, handler mqtt.MessageHandler, qos *byte) error
 		UnSubscribe(topic string) error
 		Close() error
 	}
 
 	Publisher interface {
-		Publish(topic string, payload interface{}) error
+		Publish(topic string, payload interface{}, qos *byte) error
 		Stop() error
 	}
 
 	subscriber struct {
 		subConnect mqtt.Client
+
+		qos     byte
+		timeout time.Duration
 	}
 
 	publisher struct {
 		pubConnect mqtt.Client
+
+		qos     byte
+		timeout time.Duration
 
 		isStopped bool
 		wg        *sync.WaitGroup
 	}
 )
 
-func NewSubscriber(cli mqtt.Client) Subscriber {
+func NewSubscriber(cli mqtt.Client, qos byte, timeout time.Duration) Subscriber {
 	return &subscriber{
 		subConnect: cli,
+		qos:        qos,
+		timeout:    timeout,
 	}
 }
 
-func NewPublisher(cli mqtt.Client) Publisher {
+func NewPublisher(cli mqtt.Client, qos byte, timeout time.Duration) Publisher {
 	return &publisher{
 		pubConnect: cli,
+		qos:        qos,
+		timeout:    timeout,
 		wg:         new(sync.WaitGroup),
 	}
 }
@@ -70,14 +82,16 @@ func defaultSubClient(url string) (_ Subscriber, err error) {
 	if url == "" {
 		return nil, errNoURLEnv
 	}
-	var subConnect mqtt.Client
 
-	subConnect, err = makeConnect(subID, url)
+	var subConnect mqtt.Client
+	subConnect, err = makeDefaultConnect(defaultSubID, url)
 	if err != nil {
 		return nil, err
 	}
 	return &subscriber{
 		subConnect: subConnect,
+		timeout:    defaultTimeout,
+		qos:        defaultQOS,
 	}, nil
 }
 
@@ -85,19 +99,21 @@ func defaultPubClient(url string) (_ Publisher, err error) {
 	if url == "" {
 		return nil, errNoURLEnv
 	}
-	var pubConnect mqtt.Client
 
-	pubConnect, err = makeConnect(pubID, url)
+	var pubConnect mqtt.Client
+	pubConnect, err = makeDefaultConnect(defaultPubID, url)
 	if err != nil {
 		return nil, err
 	}
 	return &publisher{
 		pubConnect: pubConnect,
 		wg:         new(sync.WaitGroup),
+		timeout:    defaultTimeout,
+		qos:        defaultQOS,
 	}, nil
 }
 
-func makeConnect(clientID, url string) (mqtt.Client, error) {
+func makeDefaultConnect(clientID, url string) (mqtt.Client, error) {
 	connID := uuid.New().String()
 	opts := mqtt.NewClientOptions()
 	opts = opts.AddBroker(url)
@@ -115,13 +131,19 @@ func makeConnect(clientID, url string) (mqtt.Client, error) {
 	return mqttClient, nil
 }
 
-func (p *publisher) Publish(topic string, payload interface{}) error {
+// qos is optional
+func (p *publisher) Publish(topic string, payload interface{}, qos *byte) error {
 	if p.isStopped {
 		return nil
 	}
 
-	token := p.pubConnect.Publish(topic, defaultQOS, false, payload)
-	if token.Wait() && token.Error() != nil {
+	var q = p.qos
+	if qos != nil {
+		q = *qos
+	}
+
+	token := p.pubConnect.Publish(topic, q, false, payload)
+	if token.WaitTimeout(p.timeout) && token.Error() != nil {
 		return token.Error()
 	}
 	return nil
@@ -143,20 +165,26 @@ func (p *publisher) Stop() error {
 	return nil
 }
 
-func (s *subscriber) Subscribe(topic string, handler mqtt.MessageHandler) error {
+// qos is optional
+func (s *subscriber) Subscribe(topic string, handler mqtt.MessageHandler, qos *byte) error {
 	if !s.subConnect.IsConnected() {
 		return errMQTTDisconnected
 	}
 
 	topic = strings.TrimSuffix(strings.TrimPrefix(topic, "/"), "/")
 
+	var q = s.qos
+	if qos != nil {
+		q = *qos
+	}
+
 	token := s.subConnect.Subscribe(
 		topic,
-		defaultQOS,
+		q,
 		handler,
 	)
 
-	if token.Wait() && token.Error() != nil {
+	if token.WaitTimeout(s.timeout) && token.Error() != nil {
 		return token.Error()
 	}
 
@@ -169,7 +197,7 @@ func (s *subscriber) UnSubscribe(topic string) error {
 	}
 
 	token := s.subConnect.Unsubscribe(topic)
-	if token.Wait() && token.Error() != nil {
+	if token.WaitTimeout(s.timeout) && token.Error() != nil {
 		return token.Error()
 	}
 	return nil
