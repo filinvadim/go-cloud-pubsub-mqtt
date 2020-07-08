@@ -1,6 +1,7 @@
 # go-cloud-pubsub-mqtt
 
-MQTT pubsub driver for Go Cloud Development Kit
+MQTT pubsub driver for Go Cloud Development Kit. Just put it in `go-cloud/pubsub/` package or do whetever you want. :)
+
 
 # REFERENCES:
 
