@@ -16,16 +16,18 @@ package mqttpubsub
 
 import (
 	"context"
+	"errors"
 	"fmt"
-	mqtt "github.com/eclipse/paho.mqtt.golang"
-	"github.com/hashicorp/go-multierror"
-	"gocloud.dev/gcerrors"
-	"gocloud.dev/pubsub"
-	"gocloud.dev/pubsub/driver"
 	"net/url"
 	"os"
 	"path"
 	"sync"
+
+	mqtt "github.com/eclipse/paho.mqtt.golang"
+	"gocloud.dev/gcerrors"
+	"gocloud.dev/pubsub"
+	"gocloud.dev/pubsub/driver"
+	"golang.org/x/exp/slices"
 )
 
 func init() {
@@ -132,9 +134,8 @@ type topic struct {
 	name string
 	conn Publisher
 
-	wg   *sync.WaitGroup
-	mu   *sync.Mutex
-	errs *multierror.Error
+	wg *sync.WaitGroup
+	mu *sync.Mutex
 }
 
 // TopicOptions sets options for constructing a *pubsub.Topic backed by
@@ -163,7 +164,6 @@ func openTopic(conn Publisher, name string) (driver.Topic, error) {
 		conn,
 		new(sync.WaitGroup),
 		new(sync.Mutex),
-		new(multierror.Error),
 	}, nil
 }
 
@@ -172,38 +172,41 @@ func (t *topic) SendBatch(ctx context.Context, msgs []*driver.Message) error {
 	if t == nil || t.conn == nil {
 		return errConnRequired
 	}
+	t.mu.Lock()
+	defer t.mu.Unlock()
 
+	var errs error
 	for _, m := range msgs {
-		if err := ctx.Err(); err != nil {
-			return err
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		default:
 		}
 		t.wg.Add(1)
 
 		go func(msg *driver.Message) {
 			defer t.wg.Done()
-			t.mu.Lock()
-			defer t.mu.Unlock()
 
 			payload, err := encodeMessage(msg)
 			if err != nil {
-				t.errs.Errors = append(t.errs.Errors, err)
+				errs = errors.Join(errs, err)
 			}
 
 			if msg.BeforeSend != nil {
 				asFunc := func(i interface{}) bool { return false }
 				if err := msg.BeforeSend(asFunc); err != nil {
-					t.errs.Errors = append(t.errs.Errors, err)
+					errs = errors.Join(errs, err)
 				}
 			}
 
 			err = t.conn.Publish(t.name, payload, nil)
 			if err != nil {
-				t.errs.Errors = append(t.errs.Errors, err)
+				errs = errors.Join(errs, err)
 			}
 		}(m)
 	}
 	t.wg.Wait()
-	return t.errs.ErrorOrNil()
+	return errs
 }
 
 // IsRetryable implements driver.Topic.IsRetryable.
@@ -245,8 +248,6 @@ type subscription struct {
 	mu          *sync.Mutex
 	msgs        []mqtt.Message
 	unackedMsgs []mqtt.Message
-
-	errs *multierror.Error
 }
 
 func OpenSubscription(conn Subscriber, topicName string, _ *SubscriptionOptions) (*pubsub.Subscription, error) {
@@ -262,9 +263,8 @@ func openSubscription(conn Subscriber, topicName string) (driver.Subscription, e
 		conn,
 		topicName,
 		new(sync.Mutex),
-		make([]mqtt.Message, 0),
-		make([]mqtt.Message, 0),
-		new(multierror.Error),
+		make([]mqtt.Message, 0, 1),
+		make([]mqtt.Message, 0, 1),
 	}
 
 	err := ds.conn.Subscribe(topicName, func(client mqtt.Client, m mqtt.Message) {
@@ -281,9 +281,6 @@ func (s *subscription) ReceiveBatch(ctx context.Context, maxMessages int) (dms [
 	if s == nil || s.conn == nil {
 		return nil, errConnRequired
 	}
-	if ctx.Err() != nil {
-		return nil, ctx.Err()
-	}
 
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -291,23 +288,35 @@ func (s *subscription) ReceiveBatch(ctx context.Context, maxMessages int) (dms [
 	if len(s.msgs) == 0 {
 		return nil, nil
 	}
+	dms = make([]*driver.Message, 0, len(s.msgs))
+	s.unackedMsgs = slices.Grow(s.unackedMsgs, func() int {
+		if len(s.msgs) > maxMessages {
+			return maxMessages
+		}
+		return len(s.msgs)
+	}())
 
+	var errs error
 	for i := 0; i < len(s.msgs); i++ {
+		select {
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		default:
+		}
 		if i >= maxMessages {
 			break
 		}
 		dm, err := decode(s.msgs[i])
 		if err != nil {
-			s.errs.Errors = append(s.errs.Errors, err)
+			errs = errors.Join(err, err)
 		}
 		dms = append(dms, dm)
 		s.unackedMsgs = append(s.unackedMsgs, s.msgs[i])
-		// pop
-		s.msgs = append(s.msgs[:i], s.msgs[(i+1):]...)
+		s.msgs = slices.Delete(s.msgs, i, i+1)
 		i--
 	}
 
-	return dms, s.errs.ErrorOrNil()
+	return dms, errs
 }
 
 // SendAcks implements driver.Subscription.SendAcks.
@@ -319,9 +328,16 @@ func (s *subscription) SendAcks(ctx context.Context, ids []driver.AckID) error {
 		return nil
 	}
 
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if len(s.unackedMsgs) == 0 {
+		return nil
+	}
 	for _, id := range ids {
-		if ctx.Err() != nil {
+		select {
+		case <-ctx.Done():
 			return ctx.Err()
+		default:
 		}
 		msgID, ok := id.(uint16)
 		if !ok {
@@ -331,20 +347,14 @@ func (s *subscription) SendAcks(ctx context.Context, ids []driver.AckID) error {
 			continue
 		}
 
-		if len(s.unackedMsgs) == 0 {
-			return nil
-		}
-
-		s.mu.Lock()
 		for i := 0; i < len(s.unackedMsgs); i++ {
 			if s.unackedMsgs[i].MessageID() == msgID {
 				// pop and ack
 				s.unackedMsgs[i].Ack()
-				s.unackedMsgs = append(s.unackedMsgs[:i], s.unackedMsgs[(i+1):]...)
+				s.unackedMsgs = slices.Delete(s.unackedMsgs, i, i+1)
 				i--
 			}
 		}
-		s.mu.Unlock()
 	}
 	return nil
 }
