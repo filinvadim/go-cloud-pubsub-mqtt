@@ -20,6 +20,7 @@ import (
 	"net"
 	"strconv"
 	"testing"
+	"time"
 
 	mqtt "github.com/eclipse/paho.mqtt.golang"
 
@@ -83,7 +84,7 @@ func (h *harness) MakeNonexistentTopic(ctx context.Context) (driver.Topic, error
 }
 
 func (h *harness) CreateSubscription(ctx context.Context, dt driver.Topic, testName string) (driver.Subscription, func(), error) {
-	ds, err := openSubscription(h.Subscriber, testName)
+	ds, err := openSubscription(h.Subscriber, testName, &SubscriptionOptions{WaitTime: 10 * time.Millisecond})
 	if err != nil {
 		return nil, nil, err
 	}
@@ -182,11 +183,11 @@ func BenchmarkBench(b *testing.B) {
 	if err != nil {
 		b.Fatal(err)
 	}
-	sub, err := OpenSubscription(hs.Subscriber, "___1", nil)
+	sub, err := OpenSubscription(hs.Subscriber, "__1", &SubscriptionOptions{10 * time.Millisecond})
 	if err != nil {
 		b.Fatal(err)
 	}
-	pub, err := OpenTopic(hs.Publisher, "___1", nil)
+	pub, err := OpenTopic(hs.Publisher, "__1", nil)
 	if err != nil {
 		b.Fatal(err)
 	}

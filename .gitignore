@@ -16,3 +16,5 @@ vendor/
 
 # IDE
 .idea/
+.vscode/
+/demo

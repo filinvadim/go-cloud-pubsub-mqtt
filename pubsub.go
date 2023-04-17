@@ -22,6 +22,7 @@ import (
 	"os"
 	"path"
 	"sync"
+	"time"
 
 	mqtt "github.com/eclipse/paho.mqtt.golang"
 	"gocloud.dev/gcerrors"
@@ -144,7 +145,9 @@ type TopicOptions struct{}
 
 // SubscriptionOptions sets options for constructing a *pubsub.Subscription
 // backed by MQTT.
-type SubscriptionOptions struct{}
+type SubscriptionOptions struct {
+	WaitTime time.Duration
+}
 
 func OpenTopic(conn Publisher, name string, _ *TopicOptions) (*pubsub.Topic, error) {
 	dt, err := openTopic(conn, name)
@@ -248,23 +251,28 @@ type subscription struct {
 	mu          *sync.Mutex
 	msgs        []mqtt.Message
 	unackedMsgs []mqtt.Message
+	opts        *SubscriptionOptions
 }
 
-func OpenSubscription(conn Subscriber, topicName string, _ *SubscriptionOptions) (*pubsub.Subscription, error) {
-	ds, err := openSubscription(conn, topicName)
+func OpenSubscription(conn Subscriber, topicName string, opts *SubscriptionOptions) (*pubsub.Subscription, error) {
+	ds, err := openSubscription(conn, topicName, opts)
 	if err != nil {
 		return nil, err
 	}
 	return pubsub.NewSubscription(ds, nil, nil), nil
 }
 
-func openSubscription(conn Subscriber, topicName string) (driver.Subscription, error) {
+func openSubscription(conn Subscriber, topicName string, opts *SubscriptionOptions) (driver.Subscription, error) {
 	ds := &subscription{
-		conn,
-		topicName,
-		new(sync.Mutex),
-		make([]mqtt.Message, 0, 1),
-		make([]mqtt.Message, 0, 1),
+		conn:        conn,
+		topicName:   topicName,
+		mu:          new(sync.Mutex),
+		msgs:        make([]mqtt.Message, 0, 128),
+		unackedMsgs: make([]mqtt.Message, 0, 128),
+		opts:        opts,
+	}
+	if ds.opts == nil {
+		ds.opts = &SubscriptionOptions{}
 	}
 
 	err := ds.conn.Subscribe(topicName, func(client mqtt.Client, m mqtt.Message) {
@@ -281,10 +289,30 @@ func (s *subscription) ReceiveBatch(ctx context.Context, maxMessages int) (dms [
 	if s == nil || s.conn == nil {
 		return nil, errConnRequired
 	}
-
+	// retry after 50ms, if no message in s.msgs
+	s.mu.Lock()
+	retry := len(s.msgs) == 0
+	s.mu.Unlock()
+	if retry {
+		if s.opts.WaitTime <= 0 {
+			return nil, nil
+		}
+		timer := time.NewTimer(s.opts.WaitTime)
+		// fmt.Println("timer")
+		select {
+		case <-timer.C:
+		case <-ctx.Done():
+			if !timer.Stop() {
+				select {
+				case <-timer.C:
+				default:
+				}
+			}
+			return nil, ctx.Err()
+		}
+	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
-
 	if len(s.msgs) == 0 {
 		return nil, nil
 	}
