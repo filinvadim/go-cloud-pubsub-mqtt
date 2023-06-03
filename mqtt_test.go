@@ -40,11 +40,11 @@ type harness struct {
 	Publisher
 }
 
-type _logger interface {
+type logger interface {
 	Log(v ...interface{})
 }
 
-func newSubPub(ctx context.Context, l _logger) (*harness, error) {
+func newSubPub(ctx context.Context, l logger) (*harness, error) {
 	url := fmt.Sprintf("%s:%d", localTestHost, testPort)
 
 	if !isMQTTListens() {
