@@ -17,10 +17,12 @@ package mqttpubsub
 import (
 	"context"
 	"fmt"
-	mqtt "github.com/eclipse/paho.mqtt.golang"
 	"net"
 	"strconv"
 	"testing"
+	"time"
+
+	mqtt "github.com/eclipse/paho.mqtt.golang"
 
 	"gocloud.dev/pubsub"
 	"gocloud.dev/pubsub/driver"
@@ -38,11 +40,15 @@ type harness struct {
 	Publisher
 }
 
-func newHarness(ctx context.Context, t *testing.T) (drivertest.Harness, error) {
+type _logger interface {
+	Log(v ...interface{})
+}
+
+func newSubPub(ctx context.Context, l _logger) (*harness, error) {
 	url := fmt.Sprintf("%s:%d", localTestHost, testPort)
 
 	if !isMQTTListens() {
-		t.Log("using the public server because the local MQTT server is not available")
+		l.Log("using the public server because the local MQTT server is not available")
 		url = fmt.Sprintf("%s:%d", publicTestHost, testPort)
 	}
 
@@ -56,6 +62,10 @@ func newHarness(ctx context.Context, t *testing.T) (drivertest.Harness, error) {
 	}
 
 	return &harness{sub, pub}, nil
+}
+
+func newHarness(ctx context.Context, t *testing.T) (drivertest.Harness, error) {
+	return newSubPub(ctx, t)
 }
 
 func (h *harness) CreateTopic(ctx context.Context, testName string) (driver.Topic, func(), error) {
@@ -74,7 +84,7 @@ func (h *harness) MakeNonexistentTopic(ctx context.Context) (driver.Topic, error
 }
 
 func (h *harness) CreateSubscription(ctx context.Context, dt driver.Topic, testName string) (driver.Subscription, func(), error) {
-	ds, err := openSubscription(h.Subscriber, testName)
+	ds, err := openSubscription(h.Subscriber, testName, &SubscriptionOptions{WaitTime: 10 * time.Millisecond})
 	if err != nil {
 		return nil, nil, err
 	}
@@ -166,6 +176,22 @@ func (mqttAsTest) BeforeSend(as func(interface{}) bool) error {
 func TestConformance(t *testing.T) {
 	asTests := []drivertest.AsTest{mqttAsTest{}}
 	drivertest.RunConformanceTests(t, newHarness, asTests)
+}
+
+func BenchmarkBench(b *testing.B) {
+	hs, err := newSubPub(context.TODO(), b)
+	if err != nil {
+		b.Fatal(err)
+	}
+	sub, err := OpenSubscription(hs.Subscriber, "__1", &SubscriptionOptions{10 * time.Millisecond})
+	if err != nil {
+		b.Fatal(err)
+	}
+	pub, err := OpenTopic(hs.Publisher, "__1", nil)
+	if err != nil {
+		b.Fatal(err)
+	}
+	drivertest.RunBenchmarks(b, pub, sub)
 }
 
 func isMQTTListens() bool {
