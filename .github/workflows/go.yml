@@ -20,6 +20,9 @@ jobs:
       uses: actions/setup-go@v3
       with:
         go-version: 1.20
+        
+    - name: Vendor
+      run: go mod vendor
 
     - name: Test
-      run: go test -v ./...
+      run: GOPATH=$PWD go test -v ./...
