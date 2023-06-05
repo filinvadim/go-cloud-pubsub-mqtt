@@ -234,8 +234,9 @@ type subscription struct {
 	conn      Subscriber
 	topicName string
 
-	mu          *sync.RWMutex
+	msgMx       *sync.RWMutex
 	msgs        []mqtt.Message
+	unackMx     *sync.RWMutex
 	unackedMsgs []mqtt.Message
 	opts        *SubscriptionOptions
 }
@@ -252,7 +253,8 @@ func openSubscription(conn Subscriber, topicName string, opts *SubscriptionOptio
 	ds := &subscription{
 		conn:        conn,
 		topicName:   topicName,
-		mu:          new(sync.RWMutex),
+		msgMx:       new(sync.RWMutex),
+		unackMx:     new(sync.RWMutex),
 		msgs:        make([]mqtt.Message, 0, 128),
 		unackedMsgs: make([]mqtt.Message, 0, 128),
 		opts:        opts,
@@ -262,9 +264,9 @@ func openSubscription(conn Subscriber, topicName string, opts *SubscriptionOptio
 	}
 
 	err := ds.conn.Subscribe(topicName, func(client mqtt.Client, m mqtt.Message) {
-		ds.mu.Lock()
+		ds.msgMx.Lock()
 		ds.msgs = append(ds.msgs, m)
-		ds.mu.Unlock()
+		ds.msgMx.Unlock()
 	}, nil)
 
 	return ds, err
@@ -275,38 +277,27 @@ func (s *subscription) ReceiveBatch(ctx context.Context, maxMessages int) (dms [
 	if s == nil || s.conn == nil {
 		return nil, errConnRequired
 	}
-	// retry after 50ms, if no message in s.msgs
-	s.mu.RLock()
+
+	s.msgMx.RLock()
 	lenMsg := len(s.msgs)
-	s.mu.RUnlock()
-
-	if lenMsg == 0 {
-		tm := time.NewTimer(s.opts.WaitTime)
-		defer tm.Stop()
-
-		if s.opts.WaitTime <= 0 {
-			return nil, nil
-		}
-		<-tm.C
-		if ctx.Err() != nil {
-			return nil, ctx.Err()
-		}
-	}
-
-	s.mu.RLock()
-	lenMsg = len(s.msgs)
-	s.mu.RUnlock()
+	s.msgMx.RUnlock()
 	if lenMsg == 0 {
 		return nil, nil
 	}
 
 	dms = make([]*driver.Message, 0, lenMsg)
+
+	s.unackMx.Lock()
 	s.unackedMsgs = slices.Grow(s.unackedMsgs, func() int {
 		if lenMsg > maxMessages {
 			return maxMessages
 		}
 		return lenMsg
 	}())
+	s.unackMx.Unlock()
+
+	s.msgMx.Lock()
+	defer s.msgMx.Unlock()
 
 	var errs error
 	for i := 0; i < len(s.msgs); i++ {
@@ -318,19 +309,18 @@ func (s *subscription) ReceiveBatch(ctx context.Context, maxMessages int) (dms [
 			break
 		}
 
-		s.mu.RLock()
 		dm, err := decode(s.msgs[i])
 		if err != nil {
 			errs = errors.Join(err, err)
 		}
-		s.mu.RUnlock()
 
 		dms = append(dms, dm)
 
-		s.mu.Lock()
+		s.unackMx.Lock()
 		s.unackedMsgs = append(s.unackedMsgs, s.msgs[i])
+		s.unackMx.Unlock()
+
 		s.msgs = slices.Delete(s.msgs, i, i+1)
-		s.mu.Unlock()
 
 		i--
 	}
@@ -347,9 +337,9 @@ func (s *subscription) SendAcks(ctx context.Context, ids []driver.AckID) error {
 		return nil
 	}
 
-	s.mu.RLock()
+	s.unackMx.RLock()
 	lenUnack := len(s.unackedMsgs)
-	s.mu.RUnlock()
+	s.unackMx.RUnlock()
 	if lenUnack == 0 {
 		return nil
 	}
@@ -367,16 +357,16 @@ func (s *subscription) SendAcks(ctx context.Context, ids []driver.AckID) error {
 			continue
 		}
 
+		s.unackMx.Lock()
 		for i := 0; i < len(s.unackedMsgs); i++ {
-			s.mu.Lock()
 			if s.unackedMsgs[i].MessageID() == msgID {
 				// pop and ack
 				s.unackedMsgs[i].Ack()
 				s.unackedMsgs = slices.Delete(s.unackedMsgs, i, i+1)
 				i--
 			}
-			s.mu.Unlock()
 		}
+		s.unackMx.Unlock()
 	}
 	return nil
 }
